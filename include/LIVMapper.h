@@ -60,7 +60,7 @@ public:
   template <typename T> void set_posestamp(T &out);
   template <typename T> void pointBodyToWorld(const Eigen::Matrix<T, 3, 1> &pi, Eigen::Matrix<T, 3, 1> &po);
   template <typename T> Eigen::Matrix<T, 3, 1> pointBodyToWorld(const Eigen::Matrix<T, 3, 1> &pi);
-  cv::Mat getImageFromMsg(const sensor_msgs::ImageConstPtr &img_msg);
+  void getImageFromMsg(const sensor_msgs::ImageConstPtr &img_msg, cv::Mat &img);
 
   std::mutex mtx_buffer, mtx_buffer_imu_prop;
   std::condition_variable sig_buffer;
@@ -134,6 +134,8 @@ public:
   vector<double> cameraextrinT;
   vector<double> cameraextrinR;
   double IMG_POINT_COV;
+  // 优化：预分配图像转换缓冲区，避免每次 cv_bridge 分配
+  cv::Mat img_cur;
 
   PointCloudXYZI::Ptr visual_sub_map;
   PointCloudXYZI::Ptr feats_undistort;

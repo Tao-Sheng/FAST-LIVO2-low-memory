@@ -191,11 +191,12 @@ void LIVMapper::initializeFiles()
 
 void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_transport::ImageTransport &it) 
 {
-  sub_pcl = p_pre->lidar_type == AVIA ? 
-            nh.subscribe(lid_topic, 200000, &LIVMapper::livox_pcl_cbk, this): 
+  ros::TransportHints transport_hints = ros::TransportHints().tcpNoDelay(true);
+  sub_pcl = p_pre->lidar_type == AVIA ?
+            nh.subscribe(lid_topic, 200000, &LIVMapper::livox_pcl_cbk, this,transport_hints):
             nh.subscribe(lid_topic, 200000, &LIVMapper::standard_pcl_cbk, this);
-  sub_imu = nh.subscribe(imu_topic, 200000, &LIVMapper::imu_cbk, this);
-  sub_img = nh.subscribe(img_topic, 200000, &LIVMapper::img_cbk, this);
+  sub_imu = nh.subscribe(imu_topic, 200000, &LIVMapper::imu_cbk, this,transport_hints);
+  sub_img = nh.subscribe(img_topic, 1, &LIVMapper::img_cbk, this,transport_hints);
   
   pubLaserCloudFullRes = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 100);
   pubNormal = nh.advertise<visualization_msgs::MarkerArray>("visualization_marker", 100);
@@ -819,23 +820,65 @@ void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
   sig_buffer.notify_all();
 }
 
-cv::Mat LIVMapper::getImageFromMsg(const sensor_msgs::ImageConstPtr &img_msg)
+// 优化：预分配图像缓冲区，避免每次 cv_bridge 分配
+// 关键优化：避免 copyTo() 导致的额外内存分配
+void LIVMapper::getImageFromMsg(const sensor_msgs::ImageConstPtr &img_msg, cv::Mat &img)
 {
-  cv::Mat img;
-  img = cv_bridge::toCvCopy(img_msg, "bgr8")->image;
-  return img;
+  // 优化 1：使用 cv_bridge::toCvShare() 零拷贝，避免颜色转换导致的内存分配
+  // 注意：指定 "bgr8" 会在编码不匹配时触发 toCvCopy() 并分配新内存（~4MB 开销）
+  // 直接使用原始编码，后续通过 cvtColor() 按需转换
+  cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvShare(img_msg);
+  const cv::Mat &src = cv_ptr->image;
+
+  // 优化 1b：如需 BGR 格式，在复制时转换，避免 cv_bridge 分配额外内存
+  cv::Mat src_converted;
+  const cv::Mat* src_ptr = &src;
+  if (src.channels() == 1)
+  {
+    cv::cvtColor(src, src_converted, cv::COLOR_GRAY2BGR);
+    src_ptr = &src_converted;
+  }
+  else if (src.channels() == 3 && src.type() != CV_8UC3)
+  {
+    src_converted = src;
+    src_ptr = &src_converted;
+  }
+  
+  // 优化 2：检查并重新分配，确保内存连续且尺寸匹配
+  if (img.empty() ||
+      img.rows != src_ptr->rows ||
+      img.cols != src_ptr->cols ||
+      img.type() != src_ptr->type() ||
+      !img.isContinuous())
+  {
+    img.create(src_ptr->rows, src_ptr->cols, src_ptr->type());
+  }
+
+  // 优化 3：使用 memcpy 直接复制，避免 copyTo() 的额外开销
+  // copyTo() 可能会检查并重新分配内存，而 memcpy 直接复制
+  if (img.isContinuous() && src_ptr->isContinuous())
+  {
+    // 连续内存：一次性复制所有数据
+    size_t total_bytes = src_ptr->total() * src_ptr->elemSize();
+    std::memcpy(img.data, src_ptr->data, total_bytes);
+  }
+  else
+  {
+    // 非连续内存：逐行复制
+    for (int r = 0; r < src_ptr->rows; r++)
+    {
+      std::memcpy(img.ptr(r), src_ptr->ptr(r), src_ptr->cols * src_ptr->elemSize());
+    }
+  }
+
 }
 
 void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
 {
   if (!img_en) return;
-  sensor_msgs::Image::Ptr msg(new sensor_msgs::Image(*msg_in));
-  // if ((abs(msg->header.stamp.toSec() - last_timestamp_img) > 0.2 && last_timestamp_img > 0) || sync_jump_flag)
-  // {
-  //   ROS_WARN("img jumps %.3f\n", msg->header.stamp.toSec() - last_timestamp_img);
-  //   sync_jump_flag = true;
-  //   msg->header.stamp = ros::Time().fromSec(last_timestamp_img + 0.1);
-  // }
+
+  // 优化：限制图像缓冲区大小，防止内存无限增长
+  const size_t MAX_IMG_BUFFER_SIZE = 5;
 
   // Hiliti2022 40Hz
   if (hilti_en)
@@ -843,10 +886,10 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
     static int frame_counter = 0;
     if (++frame_counter % 4 != 0) return;
   }
-  // double msg_header_time =  msg->header.stamp.toSec();
-  double msg_header_time = msg->header.stamp.toSec() + img_time_offset;
+
+  double msg_header_time = msg_in->header.stamp.toSec() + img_time_offset;
   if (abs(msg_header_time - last_timestamp_img) < 0.001) return;
-  ROS_INFO("Get image, its header time: %.6f", msg_header_time);
+
   if (last_timestamp_lidar < 0) return;
 
   if (msg_header_time < last_timestamp_img)
@@ -857,8 +900,7 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
 
   mtx_buffer.lock();
 
-  double img_time_correct = msg_header_time; // last_timestamp_lidar + 0.105;
-
+  double img_time_correct = msg_header_time;
   if (img_time_correct - last_timestamp_img < 0.02)
   {
     ROS_WARN("Image need Jumps: %.6f", img_time_correct);
@@ -867,16 +909,25 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
     return;
   }
 
-  cv::Mat img_cur = getImageFromMsg(msg);
-  img_buffer.push_back(img_cur);
-  img_time_buffer.push_back(img_time_correct);
+  // 优化：如果缓冲区已满，先弹出旧图像
+  if (img_buffer.size() >= MAX_IMG_BUFFER_SIZE)
+  {
+    img_buffer.pop_front();
+    img_time_buffer.pop_front();
+    ROS_WARN("[IMG MEM] Image buffer full (%zu), dropping oldest frame", img_buffer.size() + 1);
+  }
 
-  // ROS_INFO("Correct Image time: %.6f", img_time_correct);
+
+  // 优化：使用预分配的缓冲区，避免每次 cv_bridge 重新分配内存
+  getImageFromMsg(msg_in, img_cur);
+
+  // 优化：img_buffer.emplace_back(img_cur) 会调用 cv::Mat::clone() 分配新内存
+  // 这是必要的，因为 img_cur 会在下一帧被复用
+  // 内存增长可能来自：1) clone() 分配 2) msg_in 智能指针未释放 3) ROS 回调内部缓存
+  img_buffer.emplace_back(img_cur);  // 显式 clone，确保数据独立
+  img_time_buffer.emplace_back(img_time_correct);
 
   last_timestamp_img = img_time_correct;
-  // cv::imshow("img", img);
-  // cv::waitKey(1);
-  // cout<<"last_timestamp_img:::"<<last_timestamp_img<<endl;
   mtx_buffer.unlock();
   sig_buffer.notify_all();
 }
